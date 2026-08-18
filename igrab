@@ -44,8 +44,8 @@ An interactive and automated script to download videos from a connected Android 
 Options:
   -d, --dest <path>       Specify target directory on macOS (default: ~/Movies/Android_Videos)
   -s, --scan-mode <mode>  Search scope on Android:
-                            camera : Camera roll only (/sdcard/DCIM/Camera) [default]
-                            common : Common media folders (Camera, Movies, Download, Pictures)
+                            camera : Camera roll & Screen Recordings under DCIM [default]
+                            common : Common media folders (Camera, Screen Recordings, Movies, Download, Pictures)
                             deep   : Deep scan of entire user storage (/sdcard/)
   --flat                  Save all videos directly in target folder without preserving phone folder hierarchy
   --delete-after          Delete successfully downloaded videos from the Android phone to free up space
@@ -276,8 +276,8 @@ if [[ "$INTERACTIVE" == "true" ]]; then
   
   # Scan mode selection
   echo -e "\nChoose search scope on Android:"
-  echo -e "  [1] Camera roll only (/sdcard/DCIM/Camera) [Recommended/Fastest]"
-  echo -e "  [2] Common media folders (Camera, Movies, Download, Pictures)"
+  echo -e "  [1] Camera roll & Screen Recordings (/sdcard/DCIM/Camera, ScreenRecordings) [Recommended/Fastest]"
+  echo -e "  [2] Common media folders (Camera, Screen Recordings, Movies, Download, Pictures)"
   echo -e "  [3] Deep scan (Entire /sdcard/ storage - may take longer)"
   read -r -p "Select option [1-3] (default: 1): " input_mode
   case "$input_mode" in
@@ -306,10 +306,10 @@ DEST_DIR="${DEST_DIR/#\~/$HOME}"
 declare -a REMOTE_DIRS=()
 case "$SCAN_MODE" in
   camera)
-    REMOTE_DIRS=("/sdcard/DCIM/Camera")
+    REMOTE_DIRS=("/sdcard/DCIM/Camera" "/sdcard/DCIM/ScreenRecordings" "/sdcard/DCIM/Screenrecords" "/sdcard/DCIM/Screenrecord")
     ;;
   common)
-    REMOTE_DIRS=("/sdcard/DCIM/Camera" "/sdcard/Movies" "/sdcard/Download" "/sdcard/Pictures")
+    REMOTE_DIRS=("/sdcard/DCIM/Camera" "/sdcard/DCIM/ScreenRecordings" "/sdcard/DCIM/Screenrecords" "/sdcard/DCIM/Screenrecord" "/sdcard/Movies" "/sdcard/Download" "/sdcard/Pictures")
     ;;
   deep)
     REMOTE_DIRS=("/sdcard")

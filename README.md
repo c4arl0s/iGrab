@@ -55,7 +55,7 @@ Run the local script directly:
 | Argument / Flag | Description |
 | :--- | :--- |
 | `-d, --dest <path>` | Set destination directory on macOS (defaults to `~/Movies/Android_Videos`). |
-| `-s, --scan-mode <mode>` | Search scope on Android:<br>• `camera`: DCIM/Camera only *(default)*<br>• `common`: Camera, Movies, Download, Pictures<br>• `deep`: Entire internal storage (`/sdcard`) |
+| `-s, --scan-mode <mode>` | Search scope on Android:<br>• `camera`: DCIM/Camera & Screen Recordings *(default)*<br>• `common`: Camera, Screen Recordings, Movies, Download, Pictures<br>• `deep`: Entire internal storage (`/sdcard`) |
 | `--flat` | Flattens the directory structure so all files are stored directly in the target root folder. |
 | `--delete-after` | Delete successfully downloaded videos from the phone to free up space (requires confirmation). |
 | `--dry-run` | Scans and lists files that would be downloaded/skipped without performing any transfers. |
