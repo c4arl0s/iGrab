@@ -1,0 +1,538 @@
+#!/bin/bash
+
+# ==============================================================================
+# Android to macOS Video Downloader Script
+# ==============================================================================
+# Downloads videos from a connected Android phone to the macOS system.
+# Supports incremental synchronization, folder flattening, CLI flags, 
+# and post-download deletion.
+# ==============================================================================
+
+# ANSI Color Codes for Premium UI
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+BOLD='\033[1m'
+
+# Logger functions
+log_info() {
+  echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+log_success() {
+  echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
+
+log_warn() {
+  echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+log_error() {
+  echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Display Help
+show_help() {
+  cat << EOF
+Usage: $(basename "$0") [options]
+
+An interactive and automated script to download videos from a connected Android phone to macOS.
+
+Options:
+  -d, --dest <path>       Specify target directory on macOS (default: ~/Movies/Android_Videos)
+  -s, --scan-mode <mode>  Search scope on Android:
+                            camera : Camera roll only (/sdcard/DCIM/Camera) [default]
+                            common : Common media folders (Camera, Movies, Download, Pictures)
+                            deep   : Deep scan of entire user storage (/sdcard/)
+  --flat                  Save all videos directly in target folder without preserving phone folder hierarchy
+  --delete-after          Delete successfully downloaded videos from the Android phone to free up space
+  --dry-run               Scan and list files that would be downloaded without transferring them
+  -f, --force             Bypass safety prompts (e.g. for --delete-after)
+  -h, --help              Show this help message and exit
+
+Examples:
+  $(basename "$0") --scan-mode common
+  $(basename "$0") --dest ~/Desktop/AndroidVideos --flat --delete-after
+EOF
+}
+
+# Default Parameters
+DEST_DIR=""
+SCAN_MODE="camera"
+FLATTEN="false"
+DELETE_AFTER="false"
+DRY_RUN="false"
+FORCE_DELETE="false"
+INTERACTIVE="false"
+
+# Detect if script was run with no arguments
+if [ $# -eq 0 ]; then
+  INTERACTIVE="true"
+fi
+
+# Parse Command Line Arguments
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d|--dest)
+      if [ -z "$2" ] || [[ "$2" =~ ^- ]]; then
+        log_error "Option -d/--dest requires an argument."
+        exit 1
+      fi
+      DEST_DIR="$2"
+      shift 2
+      ;;
+    -s|--scan-mode)
+      if [ -z "$2" ] || [[ "$2" =~ ^- ]]; then
+        log_error "Option -s/--scan-mode requires an argument (camera|common|deep)."
+        exit 1
+      fi
+      SCAN_MODE="$2"
+      if [[ "$SCAN_MODE" != "camera" && "$SCAN_MODE" != "common" && "$SCAN_MODE" != "deep" ]]; then
+        log_error "Invalid scan-mode: $SCAN_MODE. Must be camera, common, or deep."
+        exit 1
+      fi
+      shift 2
+      ;;
+    --flat)
+      FLATTEN="true"
+      shift
+      ;;
+    --delete-after)
+      DELETE_AFTER="true"
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN="true"
+      shift
+      ;;
+    -f|--force)
+      FORCE_DELETE="true"
+      shift
+      ;;
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+    *)
+      log_error "Unknown option: $1"
+      show_help
+      exit 1
+      ;;
+  esac
+done
+
+# Check and Setup ADB Binary
+check_adb() {
+  ADB_BIN=$(command -v adb 2>/dev/null)
+  
+  if [ -z "$ADB_BIN" ]; then
+    # Check common Homebrew/SDK paths for Apple Silicon and Intel Mac
+    if [ -f "/opt/homebrew/bin/adb" ]; then
+      ADB_BIN="/opt/homebrew/bin/adb"
+    elif [ -f "/usr/local/bin/adb" ]; then
+      ADB_BIN="/usr/local/bin/adb"
+    elif [ -f "$HOME/Library/Android/sdk/platform-tools/adb" ]; then
+      ADB_BIN="$HOME/Library/Android/sdk/platform-tools/adb"
+    fi
+  fi
+  
+  if [ -z "$ADB_BIN" ] || [ ! -x "$ADB_BIN" ]; then
+    log_error "Android Debug Bridge ('adb') was not found on your system."
+    log_info "To install it on macOS, please run:"
+    echo -e "    ${BOLD}brew install android-platform-tools${NC}"
+    log_info "Or download Android SDK Platform-Tools and add it to your PATH."
+    exit 1
+  fi
+  
+  # Proactively start ADB server to prevent daemon startup logs from polluting output stream
+  $ADB_BIN start-server >/dev/null 2>&1
+}
+
+# Check Connected & Authorized Devices
+select_device() {
+  log_info "Checking connected Android devices..."
+  
+  while true; do
+    devices_output=$($ADB_BIN devices 2>/dev/null)
+    
+    device_list=()
+    unauthorized_list=()
+    offline_list=()
+    
+    while read -r line; do
+      [[ -z "$line" ]] && continue
+      [[ "$line" =~ ^List\ of\ devices ]] && continue
+      [[ "$line" =~ ^\* ]] && continue
+      
+      serial=$(echo "$line" | awk '{print $1}')
+      status=$(echo "$line" | awk '{print $2}')
+      
+      if [[ "$status" == "device" ]]; then
+        device_list+=("$serial")
+      elif [[ "$status" == "unauthorized" ]]; then
+        unauthorized_list+=("$serial")
+      elif [[ -n "$serial" ]]; then
+        offline_list+=("$serial")
+      fi
+    done <<< "$devices_output"
+    
+    if [[ ${#device_list[@]} -gt 0 ]]; then
+      break
+    fi
+    
+    if [[ ${#unauthorized_list[@]} -gt 0 ]]; then
+      echo -e "\n${YELLOW}⚠️  Device (${unauthorized_list[0]}) is connected but UNAUTHORIZED.${NC}"
+      echo "Please unlock your Android phone and check the screen."
+      echo "You should see a prompt: 'Allow USB debugging?'"
+      echo "Make sure to check 'Always allow from this computer' and tap 'Allow'."
+      echo "Waiting for authorization..."
+      sleep 3
+      continue
+    fi
+    
+    if [[ ${#offline_list[@]} -gt 0 ]]; then
+      echo -e "\n${YELLOW}⚠️  Device (${offline_list[0]}) is offline.${NC}"
+      echo "Please try unplugging it and plugging it back in."
+      sleep 3
+      continue
+    fi
+    
+    echo -e "\n${RED}❌ No connected Android devices found.${NC}"
+    echo "Please ensure:"
+    echo "  1. Your phone is connected to this Mac via a USB cable."
+    echo "  2. USB Debugging is enabled on your phone."
+    echo "     (Go to Settings > About Phone > Tap 'Build number' 7 times to enable Developer Options,"
+    echo "      then go to Developer Options and toggle 'USB Debugging' on)."
+    echo
+    read -r -p "Press Enter to try again, or Ctrl+C to exit... "
+  done
+  
+  if [[ ${#device_list[@]} -eq 1 ]]; then
+    TARGET_DEVICE="${device_list[0]}"
+    local model
+    model=$($ADB_BIN -s "$TARGET_DEVICE" shell getprop ro.product.model 2>/dev/null | tr -d '\r')
+    log_success "Target device: $TARGET_DEVICE ($model)"
+  else
+    echo -e "\nMultiple Android devices found:"
+    for i in "${!device_list[@]}"; do
+      local dev_model
+      dev_model=$($ADB_BIN -s "${device_list[i]}" shell getprop ro.product.model 2>/dev/null | tr -d '\r')
+      echo "  [$((i+1))] ${device_list[i]} ($dev_model)"
+    done
+    while true; do
+      read -r -p "Select a device (1-${#device_list[@]}): " selection
+      if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le "${#device_list[@]}" ]; then
+        TARGET_DEVICE="${device_list[$((selection-1))]}"
+        break
+      fi
+      log_error "Invalid selection. Please choose a number between 1 and ${#device_list[@]}."
+    done
+    local final_model
+    final_model=$($ADB_BIN -s "$TARGET_DEVICE" shell getprop ro.product.model 2>/dev/null | tr -d '\r')
+    log_success "Selected device: $TARGET_DEVICE ($final_model)"
+  fi
+}
+
+# Helper to Format Bytes to Human Readable Size
+format_size() {
+  local bytes=$1
+  if [ -z "$bytes" ] || [ "$bytes" -eq 0 ]; then
+    echo "0 B"
+    return
+  fi
+  if [ "$bytes" -lt 1024 ]; then
+    echo "${bytes} B"
+  elif [ "$bytes" -lt 1048576 ]; then
+    echo "$((bytes / 1024)) KB"
+  elif [ "$bytes" -lt 1073741824 ]; then
+    echo "$((bytes / 1048576)) MB"
+  else
+    local gb_ten=$((bytes * 10 / 1073741824))
+    echo "$((gb_ten / 10)).$((gb_ten % 10)) GB"
+  fi
+}
+
+# Run Check Checks
+check_adb
+select_device
+
+# Default Dest Directory if not specified
+if [ -z "$DEST_DIR" ]; then
+  DEST_DIR="$HOME/Movies/Android_Videos"
+fi
+
+# Run Interactive Options Setup if requested
+if [[ "$INTERACTIVE" == "true" ]]; then
+  echo -e "\n${BOLD}${CYAN}--- Interactive Downloader Setup ---${NC}"
+  
+  # Target directory confirmation
+  read -r -p "Enter target folder on Mac (default: $DEST_DIR): " input_dest
+  if [[ -n "$input_dest" ]]; then
+    DEST_DIR="${input_dest/#\~/$HOME}"
+  fi
+  
+  # Scan mode selection
+  echo -e "\nChoose search scope on Android:"
+  echo -e "  [1] Camera roll only (/sdcard/DCIM/Camera) [Recommended/Fastest]"
+  echo -e "  [2] Common media folders (Camera, Movies, Download, Pictures)"
+  echo -e "  [3] Deep scan (Entire /sdcard/ storage - may take longer)"
+  read -r -p "Select option [1-3] (default: 1): " input_mode
+  case "$input_mode" in
+    2) SCAN_MODE="common" ;;
+    3) SCAN_MODE="deep" ;;
+    *) SCAN_MODE="camera" ;;
+  esac
+  
+  # Flatten option
+  read -r -p "Flatten folder structure? (Save all files directly in target folder) (y/N): " input_flat
+  if [[ "$input_flat" =~ ^[yY](es)?$ ]]; then
+    FLATTEN="true"
+  fi
+  
+  # Delete option
+  read -r -p "Delete successfully downloaded videos from phone after transfer? (y/N): " input_delete
+  if [[ "$input_delete" =~ ^[yY](es)?$ ]]; then
+    DELETE_AFTER="true"
+  fi
+fi
+
+# Expand destination directory paths (just in case of ~)
+DEST_DIR="${DEST_DIR/#\~/$HOME}"
+
+# Set up source paths
+declare -a REMOTE_DIRS=()
+case "$SCAN_MODE" in
+  camera)
+    REMOTE_DIRS=("/sdcard/DCIM/Camera")
+    ;;
+  common)
+    REMOTE_DIRS=("/sdcard/DCIM/Camera" "/sdcard/Movies" "/sdcard/Download" "/sdcard/Pictures")
+    ;;
+  deep)
+    REMOTE_DIRS=("/sdcard")
+    ;;
+esac
+
+# Filter search directories to only valid ones
+valid_dirs=()
+for rdir in "${REMOTE_DIRS[@]}"; do
+  if $ADB_BIN -s "$TARGET_DEVICE" shell "[ -d '$rdir' ]" 2>/dev/null; then
+    valid_dirs+=("$rdir")
+  fi
+done
+
+if [ ${#valid_dirs[@]} -eq 0 ]; then
+  log_error "No valid search directories exist on the connected Android device."
+  exit 1
+fi
+
+# Temporary file to list all remote files found
+TEMP_LIST=$(mktemp)
+trap 'rm -f "$TEMP_LIST"' EXIT
+
+log_info "Scanning Android device for videos..."
+for rdir in "${valid_dirs[@]}"; do
+  log_info "Scanning: $rdir"
+  escaped_rdir="${rdir//\'/\'\\\'\'}"
+  
+  # Execute optimized scanning loop on Android to query file list and size in one command
+  # This filters by common video extensions case-insensitively and streams back SIZE|PATH
+  $ADB_BIN -s "$TARGET_DEVICE" shell "
+    find '$escaped_rdir' -type f \\( -name '*.mp4' -o -name '*.MP4' -o -name '*.mkv' -o -name '*.MKV' -o -name '*.mov' -o -name '*.MOV' -o -name '*.3gp' -o -name '*.3GP' -o -name '*.webm' -o -name '*.WEBM' -o -name '*.avi' -o -name '*.AVI' -o -name '*.flv' -o -name '*.FLV' -o -name '*.wmv' -o -name '*.WMV' \\) 2>/dev/null | while read -r line; do
+      stat -c '%s|%n' \"\$line\" 2>/dev/null || echo \"0|\$line\"
+    done
+  " | tr -d '\r' >> "$TEMP_LIST"
+done
+
+# Clean duplicate items from scanning overlapping regions
+sort -u -t'|' -k2 "$TEMP_LIST" -o "$TEMP_LIST"
+
+total_files=0
+total_size=0
+while IFS='|' read -r size remote_path; do
+  [[ -z "$remote_path" ]] && continue
+  ((total_files++))
+  ((total_size += size))
+done < "$TEMP_LIST"
+
+if [ "$total_files" -eq 0 ]; then
+  log_success "No videos found on the device matching selection."
+  exit 0
+fi
+
+log_success "Found $total_files videos on device (Total size: $(format_size $total_size))"
+
+# Match local/remote files and determine which to pull
+declare -a FILES_TO_DOWNLOAD=()
+declare -a SIZES_TO_DOWNLOAD=()
+declare -a LOCAL_PATHS_TO_DOWNLOAD=()
+skipped_count=0
+download_bytes=0
+
+while IFS='|' read -r size remote_path; do
+  [[ -z "$remote_path" ]] && continue
+  
+  # Clean remote prefixes to establish target paths
+  rel_path="$remote_path"
+  rel_path="${rel_path#/sdcard/}"
+  rel_path="${rel_path#/storage/emulated/0/}"
+  rel_path="${rel_path#/}"
+  
+  if [[ "$FLATTEN" == "true" ]]; then
+    base_name=$(basename "$remote_path")
+    extension="${base_name##*.}"
+    name_without_ext="${base_name%.*}"
+    
+    local_path="$DEST_DIR/$base_name"
+    counter=1
+    
+    # Avoid overwriting in flatten mode if names match but sizes differ
+    while [ -f "$local_path" ]; do
+      local_size=$(stat -f %z "$local_path" 2>/dev/null || echo 0)
+      if [ "$size" -gt 0 ] && [ "$local_size" -eq "$size" ]; then
+        break
+      fi
+      local_path="$DEST_DIR/${name_without_ext}_${counter}.${extension}"
+      ((counter++))
+    done
+  else
+    local_path="$DEST_DIR/$rel_path"
+  fi
+  
+  # Incremental logic: Check if file already exists locally with same size
+  skip="false"
+  if [ -f "$local_path" ]; then
+    local_size=$(stat -f %z "$local_path" 2>/dev/null || echo 0)
+    if [ "$size" -gt 0 ] && [ "$local_size" -eq "$size" ]; then
+      skip="true"
+    elif [ "$size" -eq 0 ]; then
+      # Assume matching if size query returned 0/empty to prevent double downloads
+      skip="true"
+    fi
+  fi
+  
+  if [[ "$skip" == "true" ]]; then
+    ((skipped_count++))
+  else
+    FILES_TO_DOWNLOAD+=("$remote_path")
+    SIZES_TO_DOWNLOAD+=("$size")
+    LOCAL_PATHS_TO_DOWNLOAD+=("$local_path")
+    ((download_bytes += size))
+  fi
+done < "$TEMP_LIST"
+
+# Output sync statistics
+echo -e "\nSummary:"
+echo -e "  Total videos on device:      $total_files ($(format_size $total_size))"
+echo -e "  Already downloaded (skipped): $skipped_count"
+echo -e "  To download:                  ${#FILES_TO_DOWNLOAD[@]} ($(format_size $download_bytes))"
+
+if [[ ${#FILES_TO_DOWNLOAD[@]} -eq 0 ]]; then
+  echo -e "\n${GREEN}🎉 All videos are already up to date!${NC}"
+  exit 0
+fi
+
+# Dry Run execution
+if [[ "$DRY_RUN" == "true" ]]; then
+  echo -e "\n${YELLOW}=== DRY RUN: Files that would be downloaded ===${NC}"
+  for i in "${!FILES_TO_DOWNLOAD[@]}"; do
+    echo "  - ${FILES_TO_DOWNLOAD[i]} -> ${LOCAL_PATHS_TO_DOWNLOAD[i]}"
+  done
+  exit 0
+fi
+
+# Download Confirmation
+if [[ "$INTERACTIVE" == "true" ]]; then
+  read -r -p "Start download? (Y/n): " confirm_dl
+  if [[ "$confirm_dl" =~ ^[nN](o)?$ ]]; then
+    log_info "Download cancelled by user."
+    exit 0
+  fi
+fi
+
+# Create target directory
+mkdir -p "$DEST_DIR"
+
+log_info "Starting download to: $DEST_DIR"
+start_time=$(date +%s)
+success_count=0
+fail_count=0
+total_bytes_transferred=0
+declare -a downloaded_files=()
+
+for i in "${!FILES_TO_DOWNLOAD[@]}"; do
+  remote_path="${FILES_TO_DOWNLOAD[i]}"
+  local_path="${LOCAL_PATHS_TO_DOWNLOAD[i]}"
+  size="${SIZES_TO_DOWNLOAD[i]}"
+  
+  size_formatted=$(format_size "$size")
+  current_count=$((i + 1))
+  total_to_download=${#FILES_TO_DOWNLOAD[@]}
+  
+  # Ensure local directories are created when not flattening
+  if [[ "$FLATTEN" != "true" ]]; then
+    mkdir -p "$(dirname "$local_path")"
+  fi
+  
+  # Short path formatting for output logs
+  display_path="$remote_path"
+  display_path="${display_path#/sdcard/}"
+  display_path="${display_path#/storage/emulated/0/}"
+  display_path="${display_path#/}"
+  
+  # Print moving status indicator
+  echo -ne "⬇️  [$current_count/$total_to_download] Pulling $display_path ($size_formatted)..."
+  
+  # Pull command execution
+  if adb_pull_output=$($ADB_BIN -s "$TARGET_DEVICE" pull "$remote_path" "$local_path" 2>/dev/null); then
+    # Overwrite line with completion checkmark
+    echo -e "\r\033[K✅ [$current_count/$total_to_download] Pulled: $display_path ($size_formatted)"
+    downloaded_files+=("$remote_path")
+    ((success_count++))
+    ((total_bytes_transferred += size))
+  else
+    # Overwrite line with error status
+    echo -e "\r\033[K❌ [$current_count/$total_to_download] Failed: $display_path"
+    log_error "ADB pull failed for $remote_path: $adb_pull_output"
+    ((fail_count++))
+  fi
+done
+
+end_time=$(date +%s)
+duration=$((end_time - start_time))
+if [ "$duration" -eq 0 ]; then duration=1; fi
+
+echo -e "\n${BOLD}${CYAN}--- Download Process Finished ---${NC}"
+log_success "Successfully downloaded $success_count videos."
+if [ "$fail_count" -gt 0 ]; then
+  log_error "Failed to download $fail_count videos."
+fi
+log_info "Total data transferred: $(format_size $total_bytes_transferred)"
+log_info "Duration: $duration seconds (Average speed: $(format_size $((total_bytes_transferred / duration)))/s)"
+
+# Delete remotely after copy completion
+if [[ "$DELETE_AFTER" == "true" && ${#downloaded_files[@]} -gt 0 ]]; then
+  echo
+  log_warn "⚠️  You requested to delete successfully downloaded videos from the Android phone."
+  if [[ "$FORCE_DELETE" != "true" ]]; then
+    read -r -p "Are you sure you want to delete these ${#downloaded_files[@]} videos from the phone? (y/N) " confirm
+    if [[ ! "$confirm" =~ ^[yY](es)?$ ]]; then
+      log_info "Deletion cancelled. Files remain on the phone."
+      exit 0
+    fi
+  fi
+  
+  log_info "Deleting ${#downloaded_files[@]} videos from the phone..."
+  for file in "${downloaded_files[@]}"; do
+    # Proper escape sequences to handle special characters and spaces inside adb shell rm command
+    escaped_file="${file//\'/\'\\\'\'}"
+    if $ADB_BIN -s "$TARGET_DEVICE" shell rm -f "'$escaped_file'" >/dev/null 2>&1; then
+      log_success "Deleted from phone: $file"
+    else
+      log_error "Failed to delete from phone: $file"
+    fi
+  done
+fi
